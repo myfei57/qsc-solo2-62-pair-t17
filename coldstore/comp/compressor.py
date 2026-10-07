@@ -156,6 +156,17 @@ class Bank:
                 raise ValueError(f"compressor {comp_id} reserved by {holder}")
             del self._reservations[comp_id]
 
+    def sync_reservation(self, comp_id: str, room_id: str) -> None:
+        """Replace the in-memory occupancy projection for a compressor."""
+
+        with self._lock:
+            if comp_id not in self._compressors:
+                return
+            if room_id:
+                self._reservations[comp_id] = room_id
+            else:
+                self._reservations.pop(comp_id, None)
+
     def reserved_by(self, comp_id: str) -> str:
         with self._lock:
             return self._reservations.get(comp_id, "")

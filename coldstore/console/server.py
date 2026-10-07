@@ -22,6 +22,11 @@ class Server:
         self.metrics = Metrics()
         register_routes(self.router, handlers)
 
+    def close(self) -> None:
+        """Release runtime-owned background resources."""
+
+        self.runtime.close()
+
     def respond(self, request: Request) -> Response:
         response = self._route(request)
         self.metrics.record(request.method, request.path, response.status)

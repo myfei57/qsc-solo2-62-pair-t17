@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from coldstore.ammonia import Monitor
 from coldstore.audit import Auditor
-from coldstore.comp import Bank
+from coldstore.comp import Bank, LeaseManager
 from coldstore.defrost import Controller
 from coldstore.evap import Condenser
 from coldstore.fan import FanSet
@@ -39,4 +39,20 @@ class Runtime:
         self.load = LoadCalculator(store)
         self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)
+        self.leases = LeaseManager(
+            store,
+            self.auditor,
+            start_reaper=True,
+            on_change=self.compressors.sync_reservation,
+        )
+        self._sync_lease_reservations()
         self.scheduler = Scheduler(store)
+
+    def close(self) -> None:
+        """Stop background runtime components."""
+
+        self.leases.close()
+
+    def _sync_lease_reservations(self) -> None:
+        for comp_id, lease in self.leases.leases().items():
+            self.compressors.sync_reservation(comp_id, lease.room_id)

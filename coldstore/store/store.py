@@ -61,6 +61,31 @@ class Store:
             del self._data[key]
             self._save_locked()
 
+    def apply(
+        self,
+        puts: dict[str, str] | None = None,
+        deletes: tuple[str, ...] | list[str] = (),
+        append_lists: dict[str, list[str]] | None = None,
+    ) -> None:
+        """Apply several key changes and list appends in one persisted write."""
+
+        with self._lock:
+            for key, value in (puts or {}).items():
+                self._data[key] = value
+            for key in deletes:
+                self._data.pop(key, None)
+            for list_key, values in (append_lists or {}).items():
+                raw = self._data.get(list_key, "[]")
+                try:
+                    items = json.loads(raw)
+                except ValueError:
+                    items = []
+                if not isinstance(items, list):
+                    items = []
+                items.extend(str(value) for value in values)
+                self._data[list_key] = json.dumps(items, ensure_ascii=False)
+            self._save_locked()
+
     def keys(self) -> list[str]:
         with self._lock:
             return sorted(self._data)

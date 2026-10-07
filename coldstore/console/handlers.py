@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from coldstore.ammonia import validate_ppm, validate_threshold
+from coldstore.comp import LeaseConflict
 from coldstore.comp import validate_stage
 from coldstore.evap import validate_baseline
 from coldstore.fan import PRIMARY, STANDBY
@@ -264,6 +265,37 @@ def temp_reset(server: "Server", request: Request) -> Response:
     return json_response({"reset": True})
 
 
+def _query_or_field(request: Request, name: str, default: str = "") -> str:
+    values = request.query.get(name)
+    if values:
+        return values[0]
+    return request.str_field(name, default)
+
+
+def _query_or_int(request: Request, name: str, default: int) -> int:
+    values = request.query.get(name)
+    if values:
+        try:
+            return int(values[0])
+        except ValueError as exc:
+            raise RequestError(400, f"field {name} must be an integer") from exc
+    return request.int_field(name, default)
+
+
+def _lease_ttl(request: Request) -> float | None:
+    if "ttl_seconds" not in request.payload:
+        return None
+    return request.float_field("ttl_seconds")
+
+
+def _lease_error(exc: LeaseConflict) -> Response:
+    status = 429 if exc.result == "queue_full" else 409
+    payload: dict[str, object] = {"error": str(exc), "result": exc.result}
+    if exc.lease is not None:
+        payload["lease"] = exc.lease.as_dict()
+    return json_response(payload, status=status)
+
+
 def comp_add(server: "Server", request: Request) -> Response:
     stages = request.int_field("stages", 1)
     if stages <= 0:
@@ -274,6 +306,7 @@ def comp_add(server: "Server", request: Request) -> Response:
 
 def comp_remove(server: "Server", request: Request) -> Response:
     comp_id = request.str_field("id")
+    server.runtime.leases.invalidate(comp_id, reason="compressor_removed")
     server.runtime.compressors.remove(comp_id)
     return json_response({"removed": comp_id})
 
@@ -325,21 +358,130 @@ def comp_order(server: "Server", request: Request) -> Response:
 def comp_reserve(server: "Server", request: Request) -> Response:
     comp_id = request.str_field("id")
     room_id = request.str_field("room")
-    bank = server.runtime.compressors
-    bank.reserve(comp_id, room_id)
-    return json_response({"id": comp_id, "room": bank.reserved_by(comp_id)})
+    try:
+        result = server.runtime.leases.acquire(
+            comp_id,
+            room_id,
+            request_id=request.str_field("request_id"),
+            ttl_seconds=_lease_ttl(request),
+            wait_seconds=request.float_field("wait_seconds", 0.0),
+            queue=False,
+        )
+    except LeaseConflict as exc:
+        return _lease_error(exc)
+    return json_response(_lease_payload(comp_id, result), status=200)
 
 
 def comp_release(server: "Server", request: Request) -> Response:
     comp_id = request.str_field("id")
     room_id = request.str_field("room")
-    bank = server.runtime.compressors
-    bank.release(comp_id, room_id)
-    return json_response({"id": comp_id, "room": bank.reserved_by(comp_id)})
+    try:
+        server.runtime.leases.release(comp_id, room_id, allow_absent=True)
+    except LeaseConflict as exc:
+        return _lease_error(exc)
+    return json_response({"id": comp_id, "room": server.runtime.leases.holder(comp_id)})
 
 
 def comp_reservations(server: "Server", request: Request) -> Response:
-    return json_response({"reservations": server.runtime.compressors.reservations()})
+    return json_response({"reservations": server.runtime.leases.reservations()})
+
+
+def lease_acquire(server: "Server", request: Request) -> Response:
+    try:
+        result = server.runtime.leases.acquire(
+            request.str_field("id"),
+            request.str_field("room"),
+            request_id=request.str_field("request_id"),
+            ttl_seconds=_lease_ttl(request),
+            wait_seconds=request.float_field("wait_seconds", 0.0),
+            queue=request.str_field("queue", "true").lower() != "false",
+        )
+    except LeaseConflict as exc:
+        return _lease_error(exc)
+    status = 202 if result.status == "queued" else 200
+    return json_response(_lease_payload(request.str_field("id"), result), status=status)
+
+
+def lease_renew(server: "Server", request: Request) -> Response:
+    comp_id = request.str_field("id")
+    room_id = request.str_field("room")
+    version_value = request.payload.get("version")
+    version = None if version_value is None else request.int_field("version")
+    try:
+        lease = server.runtime.leases.renew(
+            comp_id,
+            room_id,
+            lease_id=request.str_field("lease_id"),
+            expected_version=version,
+            ttl_seconds=_lease_ttl(request),
+        )
+    except LeaseConflict as exc:
+        return _lease_error(exc)
+    return json_response({"lease": lease.as_dict(), "room": lease.room_id})
+
+
+def lease_release(server: "Server", request: Request) -> Response:
+    comp_id = request.str_field("id")
+    room_id = request.str_field("room")
+    version_value = request.payload.get("version")
+    version = None if version_value is None else request.int_field("version")
+    try:
+        lease = server.runtime.leases.release(
+            comp_id,
+            room_id,
+            lease_id=request.str_field("lease_id"),
+            expected_version=version,
+            allow_absent=True,
+        )
+    except LeaseConflict as exc:
+        return _lease_error(exc)
+    return json_response(
+        {
+            "id": comp_id,
+            "released": lease.as_dict() if lease else None,
+            "room": server.runtime.leases.holder(comp_id),
+        }
+    )
+
+
+def lease_state(server: "Server", request: Request) -> Response:
+    comp_id = request.str_field("id")
+    lease = server.runtime.leases.lease(comp_id)
+    pending = server.runtime.leases.pending(comp_id)
+    return json_response(
+        {
+            "id": comp_id,
+            "lease": lease.as_dict() if lease else None,
+            "room": lease.room_id if lease else "",
+            "pending": [item.as_dict() for item in pending],
+            "queue_depth": len(pending),
+        }
+    )
+
+
+def lease_cancel(server: "Server", request: Request) -> Response:
+    room_id = request.str_field("room")
+    canceled = server.runtime.leases.cancel(request.str_field("request_id"), room_id)
+    if canceled is None:
+        return error_response(404, "queued lease request not found")
+    return json_response({"canceled": canceled.as_dict()})
+
+
+def lease_history(server: "Server", request: Request) -> Response:
+    comp_id = _query_or_field(request, "id")
+    room_id = _query_or_field(request, "room")
+    limit = _query_or_int(request, "limit", 100)
+    events = server.runtime.leases.history(comp_id, room_id, limit)
+    return json_response({"events": events, "count": len(events)})
+
+
+def _lease_payload(comp_id: str, result) -> dict[str, object]:
+    payload = result.as_dict()
+    payload["id"] = comp_id
+    payload["room"] = result.lease.room_id if result.lease else (
+        result.request.room_id if result.request else result.holder
+    )
+    return payload
 
 
 def valve_state(server: "Server", request: Request) -> Response:
@@ -663,6 +805,14 @@ def schedule_plan(server: "Server", request: Request) -> Response:
     return json_response(
         {"entries": [entry.as_dict() for entry in scheduler.plan(rooms)], "due": scheduler.due(rooms)}
     )
+
+
+def schedule_occupancy_history(server: "Server", request: Request) -> Response:
+    comp_id = _query_or_field(request, "id")
+    room_id = _query_or_field(request, "room")
+    limit = _query_or_int(request, "limit", 100)
+    events = server.runtime.leases.history(comp_id, room_id, limit)
+    return json_response({"events": events, "count": len(events)})
 
 
 def export_audit(server: "Server", request: Request) -> Response:

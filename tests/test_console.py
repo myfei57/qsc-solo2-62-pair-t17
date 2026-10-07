@@ -20,6 +20,7 @@ class ConsoleCase(unittest.TestCase):
         self.server = Server(self.store)
 
     def tearDown(self) -> None:
+        self.server.close()
         self.store.close()
         self._tmp.cleanup()
 
@@ -56,6 +57,7 @@ class ConsoleCase(unittest.TestCase):
                 "store",
                 "rooms",
                 "compressors",
+                "comp_leases",
                 "supply",
                 "temp",
                 "ammonia",
@@ -220,6 +222,56 @@ class ConsoleCase(unittest.TestCase):
 
         status, body = self.call("POST", "/comp/remove", {"id": "c1"})
         self.assertEqual(body["removed"], "c1")
+
+    def test_compressor_lease_queue_history_and_conflict(self) -> None:
+        self.call("POST", "/comp/add", {"id": "c1", "stages": 1})
+        status, granted = self.call(
+            "POST",
+            "/comp/lease/acquire",
+            {"id": "c1", "room": "r1", "request_id": "one", "ttl_seconds": 60},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(granted["lease"]["version"], 1)
+
+        status, queued = self.call(
+            "POST",
+            "/comp/lease/acquire",
+            {"id": "c1", "room": "r2", "request_id": "two"},
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(queued["queue_position"], 1)
+
+        status, conflict = self.call(
+            "POST",
+            "/comp/lease/acquire",
+            {"id": "c1", "room": "r3", "queue": False},
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(conflict["result"], "busy")
+
+        status, renewed = self.call(
+            "POST",
+            "/comp/lease/renew",
+            {"id": "c1", "room": "r1", "version": 1},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(renewed["lease"]["version"], 2)
+
+        status, history = self.call("GET", "/comp/lease/history", {"id": "c1"})
+        self.assertEqual(status, 200)
+        events = {event["event"] for event in history["events"]}
+        self.assertIn("granted", events)
+        self.assertIn("queued", events)
+        self.assertIn("rejected", events)
+        self.assertIn("renewed", events)
+
+        status, released = self.call(
+            "POST",
+            "/comp/lease/release",
+            {"id": "c1", "room": "r1", "lease_id": granted["lease"]["id"], "version": 2},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(released["room"], "r2")
 
     def test_fan_and_evap_routes(self) -> None:
         self.call("POST", "/fan/add", {"id": "f1", "role": "primary"})

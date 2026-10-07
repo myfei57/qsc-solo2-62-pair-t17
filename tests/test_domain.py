@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 
 from coldstore.ammonia import Monitor, level_for, validate_ppm
 from coldstore.ammonia import validate_threshold as validate_ammonia_threshold
 from coldstore.audit import Auditor
 from coldstore.comp import Bank as CompressorBank
+from coldstore.comp import LeaseConflict, LeaseManager
 from coldstore.comp import validate_stage
 from coldstore.defrost import Controller as DefrostController
 from coldstore.evap import Condenser, validate_baseline as validate_evap_baseline
@@ -429,6 +431,129 @@ class CompressorCase(unittest.TestCase):
             validate_stage(-1)
         with self.assertRaises(ValueError):
             validate_stage(20)
+
+
+class CompressorLeaseCase(unittest.TestCase):
+    def test_queue_renew_expire_and_restart_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}/state.json"
+            store = Store.open(path)
+            auditor = Auditor(store)
+            clock = 100.0
+            leases = LeaseManager(
+                store,
+                auditor,
+                default_ttl_seconds=5.0,
+                time_func=lambda: clock,
+                max_renewals=1,
+            )
+
+            first = leases.acquire("c1", "r1", request_id="req-1")
+            self.assertEqual(first.status, "granted")
+            self.assertEqual(first.lease.version, 1)
+
+            second = leases.acquire("c1", "r2", request_id="req-2")
+            self.assertEqual(second.status, "queued")
+            self.assertEqual(second.queue_position, 1)
+
+            with self.assertRaises(LeaseConflict):
+                leases.acquire("c1", "r3", request_id="req-3", queue=False)
+
+            duplicate = leases.acquire("c1", "r1", request_id="req-1")
+            self.assertEqual(duplicate.lease.id, first.lease.id)
+
+            with self.assertRaises(LeaseConflict):
+                leases.renew("c1", "r2", expected_version=1)
+            renewed = leases.renew("c1", "r1", expected_version=1)
+            self.assertEqual(renewed.version, 2)
+            self.assertEqual(renewed.expires_at, first.lease.expires_at + 5.0)
+            with self.assertRaises(LeaseConflict):
+                leases.renew("c1", "r1", expected_version=2)
+
+            clock = 111.0
+            expired = leases.reap_expired()
+            self.assertEqual(len(expired), 1)
+            promoted = leases.lease("c1")
+            self.assertIsNotNone(promoted)
+            self.assertEqual(promoted.room_id, "r2")
+            self.assertEqual(promoted.request_id, "req-2")
+
+            reopened_store = Store.open(path)
+            reopened = LeaseManager(
+                reopened_store,
+                Auditor(reopened_store),
+                time_func=lambda: clock,
+            )
+            self.assertEqual(reopened.holder("c1"), "r2")
+            history = reopened.history("c1")
+            kinds = {str(event["event"]) for event in history}
+            self.assertIn("granted", kinds)
+            self.assertIn("expired", kinds)
+            self.assertIn("renewed", kinds)
+
+    def test_fifo_wait_grants_without_duplicate_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            leases = LeaseManager(
+                store,
+                Auditor(store),
+                default_ttl_seconds=1.0,
+                reaper_interval_seconds=0.01,
+                start_reaper=True,
+            )
+            try:
+                first = leases.acquire("c1", "r1", request_id="first")
+                second = leases.acquire("c1", "r2", request_id="second", wait_seconds=2.0)
+                self.assertEqual(second.status, "granted")
+                self.assertEqual(second.lease.room_id, "r2")
+                self.assertNotEqual(first.lease.id, second.lease.id)
+            finally:
+                leases.close()
+
+    def test_concurrent_requests_are_serialised_to_one_grant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            leases = LeaseManager(store, Auditor(store))
+            results: list[str] = []
+            barrier = threading.Barrier(3)
+
+            def acquire(room_id: str) -> None:
+                barrier.wait()
+                try:
+                    result = leases.acquire("c1", room_id, queue=False)
+                except LeaseConflict:
+                    return
+                if result.status == "granted":
+                    results.append(room_id)
+
+            threads = [threading.Thread(target=acquire, args=(room,)) for room in ("r1", "r2", "r3")]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(len(results), 1)
+
+    def test_released_request_id_is_not_reissued(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            leases = LeaseManager(store, Auditor(store))
+            leases.acquire("c1", "r1", request_id="once")
+            leases.release("c1", "r1")
+            duplicate = leases.acquire("c1", "r1", request_id="once")
+            self.assertEqual(duplicate.status, "released")
+            self.assertIsNone(duplicate.lease)
+            self.assertEqual(leases.holder("c1"), "")
+
+    def test_release_promotes_next_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            leases = LeaseManager(store, Auditor(store))
+            leases.acquire("c1", "r1", request_id="one")
+            leases.acquire("c1", "r2", request_id="two")
+            leases.release("c1", "r1")
+            lease = leases.lease("c1")
+            self.assertEqual(lease.room_id, "r2")
+            self.assertEqual(leases.pending("c1"), [])
 
 
 class SupplyValveCase(unittest.TestCase):

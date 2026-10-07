@@ -16,6 +16,7 @@ def collect(rt: Runtime) -> dict[str, object]:
         "store": store_state(rt.store).as_dict(),
         "rooms": rt.rooms.state().as_dict(),
         "compressors": rt.compressors.state().as_dict(),
+        "comp_leases": rt.leases.state(),
         "supply": rt.supply.state().as_dict(),
         "temp": rt.temp.state().as_dict(),
         "ammonia": rt.ammonia.state().as_dict(),
