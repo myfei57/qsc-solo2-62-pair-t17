@@ -27,7 +27,8 @@ class Runtime:
         evap_fans = FanSet()
         self.store = store
         self.rooms = rooms
-        self.compressors = Bank()
+        self.auditor = Auditor(store)
+        self.compressors = Bank(store, self.auditor)
         self.supply = SupplyValve(store)
         self.temp = Collector(store)
         self.ammonia = Monitor(store)
@@ -38,5 +39,4 @@ class Runtime:
         self.defrost = Controller(cold_fans, rooms, store)
         self.load = LoadCalculator(store)
         self.accumulator = Accumulator(store)
-        self.auditor = Auditor(store)
         self.scheduler = Scheduler(store)

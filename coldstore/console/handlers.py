@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from coldstore.ammonia import validate_ppm, validate_threshold
-from coldstore.comp import validate_stage
+from coldstore.comp import validate_stage, validate_ttl
 from coldstore.evap import validate_baseline
 from coldstore.fan import PRIMARY, STANDBY
 from coldstore.load import validate_baseline as validate_load_baseline
@@ -333,13 +333,55 @@ def comp_reserve(server: "Server", request: Request) -> Response:
 def comp_release(server: "Server", request: Request) -> Response:
     comp_id = request.str_field("id")
     room_id = request.str_field("room")
+    version = request.int_field("version", 0)
     bank = server.runtime.compressors
-    bank.release(comp_id, room_id)
+    if version > 0:
+        bank.release_lease(comp_id, room_id, version)
+    else:
+        bank.release(comp_id, room_id)
     return json_response({"id": comp_id, "room": bank.reserved_by(comp_id)})
 
 
 def comp_reservations(server: "Server", request: Request) -> Response:
     return json_response({"reservations": server.runtime.compressors.reservations()})
+
+
+def comp_lease_acquire(server: "Server", request: Request) -> Response:
+    comp_id = request.str_field("id")
+    room_id = request.str_field("room")
+    ttl = request.float_field("ttl", 0.0)
+    if ttl < 0:
+        raise ValueError("ttl must be non-negative")
+    if ttl > 0:
+        validate_ttl(ttl)
+    wait_raw = request.payload.get("wait", False)
+    wait = wait_raw if isinstance(wait_raw, bool) else str(wait_raw).lower() in ("1", "true", "yes")
+    result = server.runtime.compressors.acquire_lease(comp_id, room_id, ttl=ttl, wait=wait)
+    return json_response(result.as_dict())
+
+
+def comp_lease_renew(server: "Server", request: Request) -> Response:
+    comp_id = request.str_field("id")
+    room_id = request.str_field("room")
+    version = request.int_field("version")
+    if version <= 0:
+        raise ValueError("version must be positive")
+    lease = server.runtime.compressors.renew_lease(comp_id, room_id, version)
+    return json_response({"id": comp_id, "lease": lease.as_dict()})
+
+
+def comp_lease_state(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.compressors.lease_state().as_dict())
+
+
+def comp_lease_history(server: "Server", request: Request) -> Response:
+    entries = server.runtime.compressors.lease_history(request.str_field("id"))
+    return json_response({"entries": entries, "count": len(entries)})
+
+
+def comp_lease_sweep(server: "Server", request: Request) -> Response:
+    expired = server.runtime.compressors.sweep_leases()
+    return json_response({"expired": expired, "count": len(expired)})
 
 
 def valve_state(server: "Server", request: Request) -> Response:

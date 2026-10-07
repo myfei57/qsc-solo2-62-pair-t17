@@ -221,6 +221,87 @@ class ConsoleCase(unittest.TestCase):
         status, body = self.call("POST", "/comp/remove", {"id": "c1"})
         self.assertEqual(body["removed"], "c1")
 
+    def test_lease_routes(self) -> None:
+        self.call("POST", "/comp/add", {"id": "c1", "stages": 2})
+        status, body = self.call("POST", "/comp/lease/acquire", {"id": "c1", "room": "r1", "ttl": 30})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["granted"])
+        self.assertEqual(body["lease"]["room"], "r1")
+        version = body["lease"]["version"]
+
+        status, body = self.call("POST", "/comp/lease/acquire", {"id": "c1", "room": "r2"})
+        self.assertEqual(body["status"], "rejected")
+        self.assertEqual(body["holder"], "r1")
+        self.assertFalse(body["granted"])
+
+        status, body = self.call(
+            "POST", "/comp/lease/acquire", {"id": "c1", "room": "r2", "wait": True}
+        )
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(body["position"], 1)
+
+        status, body = self.call(
+            "POST", "/comp/lease/renew", {"id": "c1", "room": "r1", "version": version}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["lease"]["version"], version)
+        status, body = self.call(
+            "POST", "/comp/lease/renew", {"id": "c1", "room": "r1", "version": 999}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("stale", body["error"])
+
+        status, body = self.call("GET", "/comp/leases")
+        self.assertEqual(len(body["leases"]), 1)
+        self.assertEqual(body["leases"][0]["room"], "r1")
+        self.assertEqual(body["queues"], {"c1": ["r2"]})
+
+        status, body = self.call(
+            "POST", "/comp/release", {"id": "c1", "room": "r1", "version": version}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["room"], "r2")
+
+        status, body = self.call("POST", "/comp/lease/history", {"id": "c1"})
+        events = [entry["event"] for entry in body["entries"]]
+        self.assertEqual(
+            events, ["issued", "conflict", "queued", "renewed", "conflict", "released", "issued"]
+        )
+        self.assertEqual(body["entries"][-1]["version"], version + 1)
+
+        status, body = self.call("POST", "/comp/lease/sweep")
+        self.assertEqual(body["expired"], [])
+
+        status, body = self.call("POST", "/audit/filter", {"kind": "lease_conflict"})
+        self.assertEqual(len(body["entries"]), 2)
+        status, body = self.call("POST", "/audit/filter", {"kind": "lease_issued"})
+        self.assertEqual(len(body["entries"]), 2)
+
+        status, body = self.call(
+            "POST", "/comp/lease/acquire", {"id": "c1", "room": "r3", "ttl": 9999}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("ttl", body["error"])
+
+    def test_lease_survives_console_restart(self) -> None:
+        self.call("POST", "/comp/add", {"id": "c1", "stages": 2})
+        self.call("POST", "/comp/lease/acquire", {"id": "c1", "room": "r1"})
+
+        restarted = Server(self.store)
+        response = restarted.dispatch("GET", "/comp/leases")
+        body = json.loads(response.body)
+        self.assertEqual(body["leases"][0]["room"], "r1")
+
+        restarted.dispatch("POST", "/comp/add", {"id": "c1", "stages": 2})
+        response = restarted.dispatch("POST", "/comp/lease/acquire", {"id": "c1", "room": "r2"})
+        body = json.loads(response.body)
+        self.assertEqual(body["status"], "rejected")
+        self.assertEqual(body["holder"], "r1")
+
+        response = restarted.dispatch("POST", "/comp/lease/history", {})
+        body = json.loads(response.body)
+        self.assertEqual(body["entries"][0]["event"], "issued")
+
     def test_fan_and_evap_routes(self) -> None:
         self.call("POST", "/fan/add", {"id": "f1", "role": "primary"})
         self.call("POST", "/fan/add", {"id": "f2", "role": "standby"})

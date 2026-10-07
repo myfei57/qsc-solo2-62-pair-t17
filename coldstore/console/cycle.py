@@ -45,6 +45,7 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
             rt.defrost.finish(room_id)
 
     quota_value = rt.accumulator.add(amount)
+    expired_leases = rt.compressors.sweep_leases()
     rt.auditor.record("cycle", f"{temp:.4f}")
 
     return json_response(
@@ -59,6 +60,7 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
             "defrosting": rt.defrost.defrosting(),
             "quota": quota_value,
             "cooling_load": rt.load.load_for(temp),
+            "expired_leases": expired_leases,
             "audit_count": rt.auditor.count(),
         }
     )

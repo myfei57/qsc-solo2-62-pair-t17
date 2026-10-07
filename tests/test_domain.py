@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 
 from coldstore.ammonia import Monitor, level_for, validate_ppm
 from coldstore.ammonia import validate_threshold as validate_ammonia_threshold
 from coldstore.audit import Auditor
 from coldstore.comp import Bank as CompressorBank
-from coldstore.comp import validate_stage
+from coldstore.comp import LeaseManager, validate_stage, validate_ttl
+from coldstore.comp.lease import MAX_QUEUE
 from coldstore.defrost import Controller as DefrostController
 from coldstore.evap import Condenser, validate_baseline as validate_evap_baseline
 from coldstore.fan import PRIMARY, STANDBY, FanSet
@@ -429,6 +431,205 @@ class CompressorCase(unittest.TestCase):
             validate_stage(-1)
         with self.assertRaises(ValueError):
             validate_stage(20)
+
+    def test_reservation_survives_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            bank = CompressorBank(store)
+            bank.add_compressor("c1", 2)
+            bank.reserve("c1", "r1")
+
+            reopened = CompressorBank(Store.open(f"{tmp}/state.json"))
+            self.assertEqual(reopened.reserved_by("c1"), "r1")
+            self.assertEqual(reopened.reservations(), {"c1": "r1"})
+            reopened.add_compressor("c1", 2)
+            with self.assertRaises(ValueError):
+                reopened.reserve("c1", "r2")
+            reopened.release("c1", "r1")
+            self.assertEqual(reopened.reserved_by("c1"), "")
+
+
+class LeaseCase(unittest.TestCase):
+    def open_manager(self, tmp: str, clock: list[float], ttl: float = 30.0):
+        store = Store.open(f"{tmp}/state.json")
+        auditor = Auditor(store)
+        manager = LeaseManager(store, auditor, ttl=ttl, clock=lambda: clock[0])
+        return store, auditor, manager
+
+    def test_issue_renew_release_and_conflict_audit(self) -> None:
+        clock = [1000.0]
+        with tempfile.TemporaryDirectory() as tmp:
+            _, auditor, manager = self.open_manager(tmp, clock)
+            result = manager.acquire("c1", "r1")
+            self.assertTrue(result.granted)
+            self.assertEqual(result.lease.version, 1)
+            self.assertEqual(result.lease.expires_at, 1030.0)
+            self.assertEqual(manager.holder("c1"), "r1")
+
+            conflict = manager.acquire("c1", "r2")
+            self.assertEqual(conflict.status, "rejected")
+            self.assertEqual(conflict.holder, "r1")
+            self.assertEqual(conflict.version, 1)
+
+            retry = manager.acquire("c1", "r1")
+            self.assertTrue(retry.granted)
+            self.assertEqual(retry.lease.version, 1)
+
+            renewed = manager.renew("c1", "r1", 1)
+            self.assertEqual(renewed.expires_at, 1030.0)
+            with self.assertRaises(ValueError):
+                manager.renew("c1", "r1", 99)
+            with self.assertRaises(ValueError):
+                manager.renew("c1", "r2", 1)
+            with self.assertRaises(ValueError):
+                manager.release("c1", "r2")
+            with self.assertRaises(ValueError):
+                manager.release("c1", "r1", version=99)
+
+            self.assertTrue(manager.release("c1", "r1"))
+            self.assertEqual(manager.holder("c1"), "")
+            self.assertFalse(manager.release("c1", "r1"))
+
+            kinds = auditor.count_by_kind()
+            self.assertEqual(kinds["lease_issued"], 1)
+            self.assertEqual(kinds["lease_renewed"], 1)
+            self.assertEqual(kinds["lease_released"], 1)
+            self.assertEqual(kinds["lease_conflict"], 3)
+            self.assertIn("leases active=0", manager.describe())
+
+    def test_queue_grants_in_arrival_order(self) -> None:
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as tmp:
+            _, auditor, manager = self.open_manager(tmp, clock)
+            manager.acquire("c1", "r1")
+            first = manager.acquire("c1", "r2", wait=True)
+            self.assertEqual(first.status, "queued")
+            self.assertEqual(first.position, 1)
+            second = manager.acquire("c1", "r3", wait=True)
+            self.assertEqual(second.position, 2)
+            again = manager.acquire("c1", "r2", wait=True)
+            self.assertEqual(again.position, 1)
+            self.assertEqual(manager.queue("c1"), ["r2", "r3"])
+
+            manager.release("c1", "r1")
+            self.assertEqual(manager.holder("c1"), "r2")
+            self.assertEqual(manager.lease("c1").version, 2)
+            manager.release("c1", "r2")
+            self.assertEqual(manager.holder("c1"), "r3")
+            self.assertEqual(manager.queue("c1"), [])
+            self.assertEqual(manager.lease("c1").version, 3)
+            self.assertEqual(auditor.count_by_kind()["lease_queued"], 2)
+
+    def test_queue_bound_rate_limits_waiters(self) -> None:
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, manager = self.open_manager(tmp, clock)
+            manager.acquire("c1", "r1")
+            for index in range(MAX_QUEUE):
+                result = manager.acquire("c1", f"q{index}", wait=True)
+                self.assertEqual(result.status, "queued")
+            overflow = manager.acquire("c1", "late", wait=True)
+            self.assertEqual(overflow.status, "queue_full")
+            self.assertEqual(manager.queue("c1"), [f"q{index}" for index in range(MAX_QUEUE)])
+
+    def test_expiry_reclaims_and_lazy_sweep_reissues(self) -> None:
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as tmp:
+            _, auditor, manager = self.open_manager(tmp, clock, ttl=10.0)
+            manager.acquire("c1", "r1")
+            clock[0] = 11.0
+            result = manager.acquire("c1", "r2")
+            self.assertTrue(result.granted)
+            self.assertEqual(result.lease.version, 2)
+            self.assertEqual(manager.holder("c1"), "r2")
+            kinds = auditor.count_by_kind()
+            self.assertEqual(kinds["lease_expired"], 1)
+            self.assertEqual(kinds["lease_issued"], 2)
+
+            clock[0] = 22.0
+            self.assertEqual(manager.sweep(), ["c1"])
+            self.assertEqual(manager.holder("c1"), "")
+            self.assertEqual(manager.sweep(), [])
+
+    def test_restart_recovers_without_duplicate_issuance(self) -> None:
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, manager = self.open_manager(tmp, clock, ttl=10.0)
+            manager.acquire("c1", "r1")
+            manager.acquire("c1", "r2", wait=True)
+
+            reopened, _, recovered = self.open_manager(tmp, clock, ttl=10.0)
+            self.assertEqual(recovered.holder("c1"), "r1")
+            self.assertEqual(recovered.queue("c1"), ["r2"])
+            recovered.release("c1", "r1")
+            granted = recovered.lease("c1")
+            self.assertEqual(granted.room_id, "r2")
+            self.assertEqual(granted.version, 2)
+
+            clock[0] = 100.0
+            _, _, stale = self.open_manager(tmp, clock, ttl=10.0)
+            self.assertEqual(stale.holder("c1"), "")
+            self.assertEqual(stale.queue("c1"), [])
+            reopened.close()
+
+    def test_history_and_state_projection(self) -> None:
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, manager = self.open_manager(tmp, clock)
+            manager.acquire("c1", "r1")
+            manager.acquire("c1", "r2", wait=True)
+            manager.acquire("c2", "r9")
+            history = manager.history()
+            self.assertEqual(
+                [entry["event"] for entry in history], ["issued", "queued", "issued"]
+            )
+            self.assertEqual([entry["comp"] for entry in manager.history("c1")], ["c1", "c1"])
+            state = manager.state()
+            self.assertEqual(len(state.leases), 2)
+            self.assertEqual(state.queues, {"c1": ["r2"]})
+            self.assertEqual(state.history, 3)
+            self.assertEqual(state.as_dict()["history"], 3)
+
+    def test_concurrent_acquire_has_exactly_one_winner(self) -> None:
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, manager = self.open_manager(tmp, clock)
+            winners: list[str] = []
+            lock = threading.Lock()
+
+            def race(room_id: str) -> None:
+                result = manager.acquire("c1", room_id)
+                if result.granted:
+                    with lock:
+                        winners.append(room_id)
+
+            threads = [threading.Thread(target=race, args=(f"r{i}",)) for i in range(16)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(manager.holder("c1"), winners[0])
+            self.assertEqual(manager.lease("c1").version, 1)
+
+    def test_retire_drops_lease_but_keeps_versions(self) -> None:
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, manager = self.open_manager(tmp, clock)
+            manager.acquire("c1", "r1")
+            manager.acquire("c1", "r2", wait=True)
+            manager.retire("c1")
+            self.assertEqual(manager.holder("c1"), "")
+            self.assertEqual(manager.queue("c1"), [])
+            result = manager.acquire("c1", "r3")
+            self.assertEqual(result.lease.version, 2)
+
+    def test_ttl_validation(self) -> None:
+        validate_ttl(30.0)
+        with self.assertRaises(ValueError):
+            validate_ttl(0.0)
+        with self.assertRaises(ValueError):
+            validate_ttl(5000.0)
 
 
 class SupplyValveCase(unittest.TestCase):

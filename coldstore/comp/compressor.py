@@ -1,16 +1,24 @@
-"""Compressor bank with staged loading and arbitration.
+"""Compressor bank with staged loading and lease based arbitration.
 
-Compressors are loaded one stage at a time. A compressor can be reserved by a
-single cold room at a time, which is the arbitration point: two rooms asking
-for the same machine cannot both win, so load requests stay serialised even
-when the console serves them from separate threads.
+Compressors are loaded one stage at a time. Occupancy is governed by the
+lease manager in :mod:`coldstore.comp.lease`: a room holds a compressor
+through a renewable, expiring lease rather than a bare flag, so two rooms
+can never both believe they own the machine and a room that walks away
+without releasing loses it when the lease lapses.
 """
 
 from __future__ import annotations
 
 import threading
+from typing import TYPE_CHECKING, Callable
 
-from .report import BankState, CompressorView
+from coldstore.store.store import Store
+
+from .lease import DEFAULT_TTL_SECONDS, AcquireResult, Lease, LeaseManager
+from .report import BankState, CompressorView, LeaseState
+
+if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
+    from coldstore.audit import Auditor
 
 
 class Compressor:
@@ -34,10 +42,16 @@ class Compressor:
 class Bank:
     """Thread safe registry of compressors."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        store: Store | None = None,
+        auditor: "Auditor | None" = None,
+        lease_ttl: float = DEFAULT_TTL_SECONDS,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         self._compressors: dict[str, Compressor] = {}
-        self._reservations: dict[str, str] = {}
         self._lock = threading.RLock()
+        self.leases = LeaseManager(store, auditor, ttl=lease_ttl, clock=clock)
 
     def add_compressor(self, comp_id: str, stages: int) -> Compressor:
         with self._lock:
@@ -65,7 +79,7 @@ class Bank:
             if comp_id not in self._compressors:
                 raise ValueError(f"compressor {comp_id} not found")
             del self._compressors[comp_id]
-            self._reservations.pop(comp_id, None)
+            self.leases.retire(comp_id)
 
     def stage_up(self, comp_id: str) -> int:
         with self._lock:
@@ -137,32 +151,70 @@ class Bank:
         return [compressor.id for compressor in ordered]
 
     def reserve(self, comp_id: str, room_id: str) -> str:
-        """Give one room exclusive use of a compressor."""
+        """Give one room exclusive use of a compressor.
+
+        Backed by a lease: the hold expires unless the room renews it, so a
+        room that leaves without releasing cannot squat on the machine.
+        """
 
         with self._lock:
             self._require(comp_id)
-            holder = self._reservations.get(comp_id)
-            if holder is not None and holder != room_id:
-                raise ValueError(f"compressor {comp_id} already reserved by {holder}")
-            self._reservations[comp_id] = room_id
+            result = self.leases.acquire(comp_id, room_id)
+            if not result.granted:
+                raise ValueError(f"compressor {comp_id} already reserved by {result.holder}")
             return room_id
 
     def release(self, comp_id: str, room_id: str) -> None:
         with self._lock:
-            holder = self._reservations.get(comp_id)
-            if holder is None:
-                return
-            if holder != room_id:
-                raise ValueError(f"compressor {comp_id} reserved by {holder}")
-            del self._reservations[comp_id]
+            self.leases.release(comp_id, room_id)
 
     def reserved_by(self, comp_id: str) -> str:
         with self._lock:
-            return self._reservations.get(comp_id, "")
+            return self.leases.holder(comp_id)
 
     def reservations(self) -> dict[str, str]:
         with self._lock:
-            return dict(self._reservations)
+            return {
+                comp_id: lease.room_id
+                for comp_id, lease in sorted(self.leases.active().items())
+            }
+
+    def acquire_lease(
+        self, comp_id: str, room_id: str, ttl: float = 0.0, wait: bool = False
+    ) -> AcquireResult:
+        """Lease a compressor, optionally joining the bounded wait queue."""
+
+        with self._lock:
+            self._require(comp_id)
+            return self.leases.acquire(comp_id, room_id, ttl=ttl or None, wait=wait)
+
+    def renew_lease(self, comp_id: str, room_id: str, version: int) -> Lease:
+        """Extend the holder's lease; the fencing version must match."""
+
+        with self._lock:
+            self._require(comp_id)
+            return self.leases.renew(comp_id, room_id, version)
+
+    def release_lease(self, comp_id: str, room_id: str, version: int = 0) -> bool:
+        """Release a lease, checking the fencing version when one is given."""
+
+        with self._lock:
+            self._require(comp_id)
+            return self.leases.release(comp_id, room_id, version or None)
+
+    def sweep_leases(self) -> list[str]:
+        """Reclaim every lease whose holder stopped renewing."""
+
+        with self._lock:
+            return self.leases.sweep()
+
+    def lease_state(self) -> LeaseState:
+        with self._lock:
+            return self.leases.state()
+
+    def lease_history(self, comp_id: str = "") -> list[dict[str, object]]:
+        with self._lock:
+            return self.leases.history(comp_id)
 
     def state(self) -> BankState:
         compressors = self.compressors()

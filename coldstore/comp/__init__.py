@@ -1,12 +1,18 @@
-"""Staged compressor loading with room arbitration."""
+"""Staged compressor loading with lease based room arbitration."""
 
 from .compressor import Bank, Compressor
-from .report import BankState, CompressorView, validate_stage
+from .lease import AcquireResult, Lease, LeaseManager
+from .report import BankState, CompressorView, LeaseState, validate_stage, validate_ttl
 
 __all__ = [
+    "AcquireResult",
     "Bank",
     "BankState",
     "Compressor",
     "CompressorView",
+    "Lease",
+    "LeaseManager",
+    "LeaseState",
     "validate_stage",
+    "validate_ttl",
 ]
